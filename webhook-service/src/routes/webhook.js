@@ -20,7 +20,7 @@ router.get('/', (req, res) => {
 
 router.post('/', express.raw({ type: 'application/json' }), async (req, res) => {
   const signature = req.headers['x-hub-signature-256'];
-  if (!verifySignature(req.body, signature)) {
+  if (process.env.NODE_ENV !== 'development' && !verifySignature(req.body, signature)) {
     console.error(' Invalid signature');
     return res.sendStatus(401);
   }
