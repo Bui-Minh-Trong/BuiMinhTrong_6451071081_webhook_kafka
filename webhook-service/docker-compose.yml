@@ -25,6 +25,8 @@ services:
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      # Tự động tạo sẵn tất cả topic khi Kafka khởi động
+      KAFKA_CREATE_TOPICS: "raw_events:1:1,processed_events:1:1,send_failed:1:1,manual_review_queue:1:1,pending_review:1:1,dead_letter:1:1"
     networks:
       - app-network
 
