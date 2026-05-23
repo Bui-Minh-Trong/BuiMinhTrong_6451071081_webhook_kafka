@@ -1,11 +1,9 @@
-// Decision Engine — điều phối toàn bộ pipeline xử lý event
-// Thứ tự: Idempotency → Blacklist → Rate Limit → Spam → AI → Action
-const { detectSpam }                     = require('./spamDetector');
-const { analyzeComment }                 = require('./aiAnalyzer');
-const blacklist                          = require('../services/blacklist');
-const facebookApi                        = require('../services/facebookApi');
-const { setState, getState, STATES }     = require('../services/stateTracker');
-const { checkRateLimit }                 = require('../services/rateLimiter');
+const { detectSpam }                 = require('./spamDetector');
+const { analyzeComment }             = require('./aiAnalyzer');
+const blacklist                      = require('../services/blacklist');
+const facebookApi                    = require('../services/facebookApi');
+const { setState, getState, STATES } = require('../services/stateTracker');
+const { checkRateLimit }             = require('../services/rateLimiter');
 
 async function processEvent(event, kafkaProducer) {
   const { eventId, senderId, content, metadata } = event;
@@ -14,73 +12,41 @@ async function processEvent(event, kafkaProducer) {
   const commentId = metadata?.commentId;
   const postId    = metadata?.postId;
 
-  // ════════════════════════════════════════════════════
-  // BƯỚC 0: IDEMPOTENCY — tránh xử lý trùng event
-  // Nếu event đã ở trạng thái kết thúc (processed/hidden/replied)
-  // thì bỏ qua, tránh thực hiện lại hành động (ví dụ: ẩn comment 2 lần)
-  // ════════════════════════════════════════════════════
-  const existingState = await getState(eventId);
-  if (existingState) {
-    const terminalStates = [STATES.PROCESSED, STATES.HIDDEN, STATES.REPLIED, STATES.PENDING_REVIEW];
-    if (terminalStates.includes(existingState.state)) {
-      console.log(
-        `[Decision] Idempotency: Event ${eventId} đã ở trạng thái "${existingState.state}" → bỏ qua`
-      );
+  // idempotency: bỏ qua nếu event đã được xử lý xong trước đó
+  const existing = await getState(eventId);
+  if (existing) {
+    const done = [STATES.PROCESSED, STATES.HIDDEN, STATES.REPLIED, STATES.PENDING_REVIEW];
+    if (done.includes(existing.state)) {
+      console.log(`[Decision] ${eventId} already "${existing.state}", skip`);
       return;
     }
   }
 
-  // Đánh dấu đang xử lý
   await setState(eventId, STATES.PROCESSING);
 
   try {
-    // ════════════════════════════════════════════════════
-    // BƯỚC 1: BLACKLIST — bỏ qua hoàn toàn user vi phạm
-    // ════════════════════════════════════════════════════
-    if (userId && (await blacklist.isBlacklisted(userId))) {
-      console.log(`[Decision] User ${userId} trong blacklist → bỏ qua`);
+    // 1. blacklist
+    if (userId && await blacklist.isBlacklisted(userId)) {
       await setState(eventId, STATES.HIDDEN, { reason: 'blacklisted' });
       return;
     }
 
-    // ════════════════════════════════════════════════════
-    // BƯỚC 2: RATE LIMITING — phát hiện hành vi bất thường
-    // Nếu user gửi quá nhiều bình luận trong thời gian ngắn
-    // → chuyển sang pending_review, không xử lý tự động
-    // ════════════════════════════════════════════════════
+    // 2. rate limit — hành vi bất thường, không tự động xử lý
     const rateCheck = await checkRateLimit(userId);
     if (rateCheck.limited) {
-      console.warn(
-        `[Decision] User ${userId} bị rate limit (${rateCheck.count} req) → pending_review`
-      );
-      await setState(eventId, STATES.PENDING_REVIEW, {
-        reason:    'rate_limited',
-        reqCount:  rateCheck.count,
-      });
-      // Publish sang hàng chờ để admin xem xét
+      console.warn(`[Decision] ${userId} rate limited (${rateCheck.count} req) → pending_review`);
+      await setState(eventId, STATES.PENDING_REVIEW, { reason: 'rate_limited', reqCount: rateCheck.count });
       await kafkaProducer.send({
         topic: 'pending_review',
-        messages: [
-          {
-            value: JSON.stringify({
-              event,
-              reason:   'rate_limited',
-              reqCount: rateCheck.count,
-              timestamp: Date.now(),
-            }),
-          },
-        ],
+        messages: [{ value: JSON.stringify({ event, reason: 'rate_limited', reqCount: rateCheck.count, timestamp: Date.now() }) }],
       });
       return;
     }
 
-    // ════════════════════════════════════════════════════
-    // BƯỚC 3: SPAM DETECTION
-    // ════════════════════════════════════════════════════
+    // 3. spam detection
     const spamResult = detectSpam(message);
 
     if (spamResult.spamLevel === 'heavy') {
-      // Spam nặng (link scam/bot rõ ràng) → ẩn ngay + đưa vào hàng review thủ công
       await facebookApi.hideComment(commentId);
       await kafkaProducer.send({
         topic: 'manual_review_queue',
@@ -91,64 +57,43 @@ async function processEvent(event, kafkaProducer) {
     }
 
     if (spamResult.spamLevel === 'light') {
-      // Spam nhẹ → ẩn ngay, đếm lần vi phạm
       const spamCount = await blacklist.incrementSpamCount(userId);
+      await facebookApi.hideComment(commentId);
 
       if (spamCount >= 3) {
-        // Vi phạm 3 lần trong 24h → blacklist nội bộ
+        // đủ 3 lần trong 24h → blacklist
         await blacklist.addToBlacklist(userId, 'spam_repeat_3_times');
-        await facebookApi.hideComment(commentId);
         await setState(eventId, STATES.HIDDEN, { reason: 'spam_blacklisted', spamCount });
-        console.log(`[Decision] User ${userId} bị blacklist sau ${spamCount} lần spam`);
+        console.log(`[Decision] ${userId} blacklisted after ${spamCount} spam`);
       } else {
-        // Chưa đủ 3 lần → chỉ ẩn comment
-        await facebookApi.hideComment(commentId);
         await setState(eventId, STATES.HIDDEN, { spamLevel: 'light', spamCount });
       }
       return;
     }
 
-    // ════════════════════════════════════════════════════
-    // BƯỚC 4: AI ANALYSIS — phân loại intent & sentiment
-    // ════════════════════════════════════════════════════
+    // 4. AI analysis
     const aiResult = await analyzeComment(message);
     await setState(eventId, STATES.PROCESSED, { spamResult, aiResult });
 
-    // Publish kết quả đã xử lý để các service downstream sử dụng
     await kafkaProducer.send({
       topic: 'processed_events',
-      messages: [
-        {
-          value: JSON.stringify({
-            eventId, userId, commentId, message, postId,
-            analysis: { spam: spamResult, ai: aiResult },
-            timestamp: Date.now(),
-          }),
-        },
-      ],
+      messages: [{ value: JSON.stringify({
+        eventId, userId, commentId, message, postId,
+        analysis: { spam: spamResult, ai: aiResult },
+        timestamp: Date.now(),
+      }) }],
     });
 
-    console.log(
-      `[Decision] Event ${eventId}: intent=${aiResult.intent}, sentiment=${aiResult.sentiment}, source=${aiResult.source}`
-    );
+    console.log(`[Decision] ${eventId}: intent=${aiResult.intent} sentiment=${aiResult.sentiment} src=${aiResult.source}`);
 
   } catch (err) {
-    console.error(`[Decision] Lỗi khi xử lý ${eventId}:`, err.message);
+    console.error(`[Decision] failed ${eventId}:`, err.message);
     await setState(eventId, STATES.FAILED, { error: err.message });
 
-    // Publish sang send_failed để Retry Service xử lý lại
+    // đẩy sang retry service
     await kafkaProducer.send({
       topic: 'send_failed',
-      messages: [
-        {
-          value: JSON.stringify({
-            event,
-            error:      err.message,
-            retryCount: 0,
-            timestamp:  Date.now(),
-          }),
-        },
-      ],
+      messages: [{ value: JSON.stringify({ event, error: err.message, retryCount: 0, timestamp: Date.now() }) }],
     });
   }
 }
